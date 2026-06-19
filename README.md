@@ -25,9 +25,9 @@ Web3 생태계의 급성장과 함께 스마트 컨트랙트를 대상으로 한
 
 ### 1-2. 기존 도구의 한계 분석
 
-**① 정적 분석 도구 (Slither, Semgrep 등)**
+**① 정적 분석 도구 (Slither, Mythril 등)**
 
-정적 분석 도구는 소스코드의 AST(Abstract Syntax Tree) 및 CFG(Control Flow Graph)를 파싱해 사전 정의된 취약 패턴을 탐지한다. 분석 속도가 빠르고 전체 코드베이스를 커버할 수 있다는 장점이 있으나, 실행 컨텍스트 없이 패턴만 매칭하므로 **False Positive 비율이 높고**, 탐지된 취약점이 실제로 익스플로잇 가능한지 검증하지 못한다.
+정적 분석 도구는 소스코드를 AST(Abstract Syntax Tree) 및 CFG(Control Flow Graph)로 파싱한 뒤, 자체 중간 표현인 SlithIR(SSA 기반 3-주소 코드)로 변환하여 취약 패턴을 탐지한다. 분석 속도가 빠르고 전체 코드베이스를 커버할 수 있다는 장점이 있으나, 실행 컨텍스트 없이 패턴만 매칭하므로 **False Positive 비율이 높고**, 탐지된 취약점이 실제로 익스플로잇 가능한지 검증하지 못한다.
 
 **② 동적 퍼징 도구 (Echidna, Medusa 등)**
 
@@ -58,14 +58,17 @@ Solidity 소스코드 및 EVM 바이트코드를 입력받아, 정적 분석 →
 | 1 | 정적 분석 파이프라인 구현 | Slither API로 취약 후보 함수 JSON 추출 |
 | 2 | 퍼징 자동화 | 정적 분석 결과를 Medusa 시드로 주입하여 퍼징 실행 |
 | 3 | 파이프라인 통합 | 단일 CLI 명령으로 전체 파이프라인 실행 |
-| 4 | 최종 검증 | Damn Vulnerable DeFi 컨트랙트 대상 취약점 탐지 성공 |
+| 4 | 최종 검증 | Damn Vulnerable DeFi v3 대상 취약점 탐지 성공 — Reentrancy(Rewarder), Access Control(NaiveReceiver), Unchecked Return(TrusterLenderPool) 3개 챌린지 검증 |
+| 5 | 커버리지 향상 측정 | 정적 분석 단독 시드 대비 하이브리드 시드로 branch coverage 향상 확인 |
+| 6 | FP 감소 측정 | Slither 단독 실행 대비 퍼징 검증 후 False Positive 비율 감소 확인 |
+| 7 | 탐지 시간 측정 | 수동 감사 대비 초기 후보 추출 소요 시간 기록 |
 
 ### 2-2. 범위 (Scope)
 
 **In-Scope**
 - Solidity 소스코드(`.sol`) 입력 분석
 - EVM 바이트코드 입력 분석 (소스 없는 배포 컨트랙트 대응)
-- Reentrancy, Integer Overflow/Underflow, Access Control, Unchecked External Call 탐지
+- Reentrancy, Integer Overflow/Underflow (unchecked 블록, 인라인 어셈블리, 다운캐스팅 대상 한정 — Solidity 0.8.x 기본 built-in 보호 범위 외), Access Control, Unchecked External Call 탐지
 - 취약점 심각도 분류 (Critical / High / Medium / Low)
 - Markdown / JSON 형식 리포트 자동 생성
 
@@ -89,10 +92,17 @@ Solidity 소스코드 및 EVM 바이트코드를 입력받아, 정적 분석 →
 │  · 바이트코드 입력 시 pyevmasm 디스어셈블 후 분석          │
 └──────────────────────┬──────────────────────────────┘
                        ↓ (취약 후보 함수 목록 + 힌트 JSON)
+                         corpus seed 변환: 함수 selector → method 필드 /
+                         인자 타입 힌트 → arguments 초기값 /
+                         선행 호출 순서 → CallSequenceElement 배열 순서
 ┌─────────────────────────────────────────────────────┐
 │                   Stage 2 : 동적 퍼징                  │
 │  · Medusa — 정적 분석 힌트 기반 시드 corpus 주입          │
-│  · Anvil 로컬 EVM 환경에서 실행                          │
+│  · Medusa 내장 TestChain (medusa-geth 기반) 환경에서 실행 │
+│  · invariant 자동 생성 (취약 유형별 템플릿 기반):          │
+│    Reentrancy → 잔액 불변 조건                          │
+│    Access Control → 권한 없는 주소 상태 변경 불변 조건    │
+│    Integer Overflow → 연산 전후 값 범위 불변 조건         │
 │  · 커버리지 기반 변이(mutation)로 취약 경로 탐색           │
 └──────────────────────┬──────────────────────────────┘
                        ↓ (트리거된 취약점 + 재현 트랜잭션)
@@ -127,9 +137,10 @@ Solidity 소스코드 및 EVM 바이트코드를 입력받아, 정적 분석 →
 
 **Phase 2 — Medusa 퍼징 자동화 (2주)**
 - Medusa 소스 구조 분석 및 커스텀 포인트 파악
-- 정적 분석 결과 → Medusa corpus seed 변환 로직 구현
-- Anvil 로컬 EVM 환경 연동 및 자동 실행 스크립트 작성
-- 산출물: `fuzzing_engine.py`, `seed_injector.py`
+- 정적 분석 결과 → Medusa corpus seed 변환 로직 구현 (Slither 추출 함수 selector → corpus method 필드, 인자 타입 힌트 → arguments 초기값, 선행 호출 순서 → CallSequenceElement 배열)
+- 취약 유형별 Invariant 템플릿 자동 생성 로직 구현 (Reentrancy → 잔액 불변 조건, Access Control → 권한 불변 조건, Integer Overflow → 값 범위 불변 조건), SlithIR 상태 변수·함수 시그니처 기반 `.sol` 파일 자동 출력
+- Medusa TestChain 환경 구성 및 자동 실행 스크립트 작성
+- 산출물: `fuzzing_engine.py`, `seed_injector.py`, `invariant_generator.py`
 
 **Phase 3 — 파이프라인 통합 및 CLI (1주)**
 - Stage 1 → 2 자동 연결 오케스트레이터 구현
@@ -140,7 +151,7 @@ Solidity 소스코드 및 EVM 바이트코드를 입력받아, 정적 분석 →
 **Phase 4 — 리포팅 & 최종 검증 (1주)**
 - 취약점 심각도 평가 로직 구현
 - Jinja2 기반 Markdown / JSON 리포트 생성기 구현
-- Damn Vulnerable DeFi 컨트랙트 대상 end-to-end 검증
+- Damn Vulnerable DeFi v3 대상 end-to-end 검증 (Reentrancy/Rewarder, Access Control/NaiveReceiver, Unchecked Return/TrusterLenderPool 3개 챌린지)
 - 산출물: `reporter.py`, 최종 검증 리포트
 
 ---
@@ -150,9 +161,8 @@ Solidity 소스코드 및 EVM 바이트코드를 입력받아, 정적 분석 →
 | 레이어 | 기술 | 버전 | 선택 이유 |
 |---|---|---|---|
 | 정적 분석 | Slither | 0.10.x | Python API 지원, 커스텀 Detector 작성 가능 |
-| 동적 퍼징 | Medusa | latest | Go 기반으로 소스 수정 용이, API 친화적 리포팅 |
+| 동적 퍼징 | Medusa | latest | Go 기반으로 소스 수정 용이, API 친화적 리포팅; go-ethereum 기반 자체 EVM(TestChain) 내장, 외부 EVM 환경 불필요 |
 | 바이트코드 분석 | pyevmasm | 0.2.x | EVM 바이트코드 디스어셈블, 소스 없는 컨트랙트 대응 |
-| 테스트 환경 | Anvil (Foundry) | latest | 경량 로컬 EVM, 블록 상태 포크 지원 |
 | 오케스트레이션 | Python | 3.10+ | Slither 연동 및 전체 파이프라인 제어 |
 | 리포팅 | Jinja2 | 3.x | 템플릿 기반 유연한 리포트 생성 |
 
